@@ -1,15 +1,18 @@
 import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
+import 'package:audioplayers/audioplayers.dart';
 
 import '../models/ball.dart';
 import '../models/zone.dart';
+import '../models/floating_text.dart';
 
 class PhysicsManager {
-  // ===== PUBLIC DATA (USED BY MAIN & PAINTER) =====
+  // ===== PUBLIC DATA =====
   final List<Ball> balls = [];
   final List<Offset> pegs = [];
   final List<Zone> zones = [];
+  final List<FloatingText> floatingTexts = [];
 
   double ballRadius = 0;
   double pegRadius = 0;
@@ -22,13 +25,20 @@ class PhysicsManager {
 
   // ===== INTERNAL =====
   late void Function(double win) _onScore;
+  late VoidCallback _onFrame;
 
   late Ticker _ticker;
   Duration _lastTime = Duration.zero;
 
+  final AudioPlayer audio = AudioPlayer();
+
   // ===== INIT =====
-  void init({required void Function(double win) onScore}) {
+  void init({
+    required void Function(double win) onScore,
+    required VoidCallback onFrame,
+  }) {
     _onScore = onScore;
+    _onFrame = onFrame;
     _ticker = Ticker(_onTick);
   }
 
@@ -71,26 +81,32 @@ class PhysicsManager {
       }
     }
 
-    // Bottom row
+    // Build zones
     final bottomCount = topPegCount + pegRows - 1;
     final bottomRow = pegs.sublist(pegs.length - bottomCount);
 
     final leftPeg = bottomRow.first.dx;
     final rightPeg = bottomRow.last.dx;
 
+    final padding = ballRadius * 1.25;
+    leftWallX = leftPeg - padding;
+    rightWallX = rightPeg + padding;
+
     final multipliers = [
       25, 10, 5, 4.5, 4, 3.5, 3, 2.5, 2, 1.5, 1, 0.5, 0.2,
-      0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5, 10, 25
+      0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5, 10, 25,
     ];
 
-    final span = (rightPeg - leftPeg) / (multipliers.length - 2);
-
-    leftWallX = leftPeg - span;
-    rightWallX = rightPeg + span;
+    final span = (rightWallX - leftWallX) / multipliers.length;
 
     for (int i = 0; i < multipliers.length; i++) {
-      final x0 = leftWallX + i * span;
-      zones.add(Zone(x0, x0 + span, multipliers[i].toDouble()));
+      zones.add(
+        Zone(
+          leftWallX + (i * span),
+          leftWallX + ((i + 1) * span),
+          multipliers[i].toDouble(),
+        ),
+      );
     }
 
     bucketTop = bottomRow.first.dy + ballRadius * 2.2;
@@ -100,12 +116,14 @@ class PhysicsManager {
   void dropBall(double wager) {
     if (boardSize == Size.zero || pegs.isEmpty) return;
 
-    final spawnX =
-        (leftWallX + rightWallX) / 2 +
-        Random().nextDouble() * ballRadius * 2 -
-        ballRadius;
+    const int topPegCount = 5;
+    final centerIndex = topPegCount ~/ 2;
+    final centerPeg = pegs[centerIndex];
 
-    final spawnY = pegs.first.dy - ballRadius * 6;
+    final dx = (Random().nextDouble() * 2 - 1) * ballRadius * 0.25;
+
+    final spawnX = centerPeg.dx + dx;
+    final spawnY = centerPeg.dy - ballRadius * 9;
 
     balls.add(
       Ball(
@@ -114,6 +132,8 @@ class PhysicsManager {
         wager: wager,
       ),
     );
+
+    audio.play(AssetSource('sounds/drop.wav'), volume: 0.4);
 
     if (!_ticker.isActive) {
       _lastTime = Duration.zero;
@@ -128,93 +148,157 @@ class PhysicsManager {
       return;
     }
 
-    final dt = (elapsed - _lastTime).inMicroseconds / 1e6;
+    double dt = (elapsed - _lastTime).inMicroseconds / 1e6;
+    dt = dt.clamp(0.0, 0.02); // Prevent tunneling
     _lastTime = elapsed;
 
-    if (balls.isEmpty) {
+    // Update floating texts
+    for (final ft in floatingTexts) {
+      ft.update(dt);
+    }
+    floatingTexts.removeWhere((ft) => ft.expired);
+
+    // Check if glow still active
+    final now = DateTime.now();
+    bool glowActive = false;
+    for (final z in zones) {
+      if (z.highlightUntil != null && now.isBefore(z.highlightUntil!)) {
+        glowActive = true;
+        break;
+      }
+    }
+
+    // If no balls and no glow, stop ticker
+    if (balls.isEmpty && !glowActive && floatingTexts.isEmpty) {
       _ticker.stop();
+      _onFrame();
       return;
     }
 
-    _step(dt);
+    // Physics step only if balls remain
+    if (balls.isNotEmpty) {
+      _step(dt);
+    }
+
+    _onFrame();
   }
 
   // ===== PHYSICS STEP =====
   void _step(double dt) {
-    const gravity = 950.0;
-    const airDrag = 0.05;
+    const gravity = 1045.0; // +10% faster fall
+    const drag = 0.05;
 
-    final toRemove = <Ball>[];
+    final remove = <Ball>[];
 
     for (final ball in balls) {
-      // Gravity
+      // Apply gravity + drag
       ball.vel = Offset(ball.vel.dx, ball.vel.dy + gravity * dt);
+      ball.vel *= (1 - drag * dt);
 
-      // Drag
-      ball.vel *= (1 - airDrag * dt);
-
-      // Integrate
+      // Move
       ball.pos += ball.vel * dt;
 
       _collideWalls(ball);
       _collidePegs(ball);
 
-      // Zone hit
+      // Scoring
       if (!ball.scored && ball.pos.dy >= bucketTop) {
         final z = _zoneForX(ball.pos.dx);
         if (z != null) {
           ball.scored = true;
+
+          // Trigger glow
+          z.highlightUntil =
+              DateTime.now().add(const Duration(milliseconds: 200));
+
+          // Floating text pop
+          floatingTexts.add(
+            FloatingText(
+              position: Offset(ball.pos.dx, bucketTop - 20),
+              amount: ball.wager * z.multiplier,
+            ),
+          );
+
+          audio.play(AssetSource('sounds/score.wav'), volume: 0.7);
+
           _onScore(ball.wager * z.multiplier);
-          toRemove.add(ball);
+
+          remove.add(ball);
           continue;
         }
       }
 
-      // Cleanup
-      if (ball.pos.dy > boardSize.height + ballRadius * 2) {
-        toRemove.add(ball);
+      // Off-screen cleanup
+      if (ball.pos.dy > boardSize.height + ballRadius * 3) {
+        remove.add(ball);
       }
     }
 
-    for (final b in toRemove) {
+    for (final b in remove) {
       balls.remove(b);
     }
   }
 
-  // ===== COLLISIONS =====
+  // ===== WALL COLLISION =====
   void _collideWalls(Ball ball) {
-    final dxL = ball.pos.dx - leftWallX;
-    if (dxL.abs() < ballRadius) {
+    const wallBounce = 0.6; // bouncier walls
+
+    if (ball.pos.dx - leftWallX < ballRadius) {
       ball.pos = Offset(leftWallX + ballRadius, ball.pos.dy);
-      ball.vel = Offset(-ball.vel.dx * 0.35, ball.vel.dy);
+      ball.vel = Offset(-ball.vel.dx * wallBounce, ball.vel.dy);
+      audio.play(AssetSource('sounds/wall.wav'), volume: 0.25);
     }
 
-    final dxR = rightWallX - ball.pos.dx;
-    if (dxR.abs() < ballRadius) {
+    if (rightWallX - ball.pos.dx < ballRadius) {
       ball.pos = Offset(rightWallX - ballRadius, ball.pos.dy);
-      ball.vel = Offset(-ball.vel.dx * 0.35, ball.vel.dy);
+      ball.vel = Offset(-ball.vel.dx * wallBounce, ball.vel.dy);
+      audio.play(AssetSource('sounds/wall.wav'), volume: 0.25);
     }
   }
 
+  // ===== PEG COLLISION =====
   void _collidePegs(Ball ball) {
-    for (final p in pegs) {
-      final d = ball.pos - p;
+    const double elasticity = 0.32;
+    const double tangential = 0.12;
+
+    for (final peg in pegs) {
+      final d = ball.pos - peg;
       final dist = d.distance;
-      final minD = pegRadius + ballRadius;
 
-      if (dist > 0 && dist < minD) {
+      final minDist = ballRadius + pegRadius + 0.5;
+
+      if (dist > 0 && dist < minDist) {
         final n = d / dist;
-        ball.pos += n * (minD - dist + 0.5);
+        final overlap = minDist - dist;
 
-        final vDot = ball.vel.dx * n.dx + ball.vel.dy * n.dy;
-        if (vDot < 0) {
-          ball.vel -= n * ((1 + 0.28) * vDot);
+        ball.pos += n * (overlap + 0.75);
+
+        final v = ball.vel;
+        final vn = v.dx * n.dx + v.dy * n.dy;
+
+        if (vn < 0) {
+          final t = Offset(-n.dy, n.dx);
+          final vt = v.dx * t.dx + v.dy * t.dy;
+
+          final reflectedNormal = Offset(
+            (-elasticity * vn) * n.dx,
+            (-elasticity * vn) * n.dy,
+          );
+
+          final tangentialPart = Offset(
+            (vt * (1 - tangential)) * t.dx,
+            (vt * (1 - tangential)) * t.dy,
+          );
+
+          ball.vel = reflectedNormal + tangentialPart;
+
+          audio.play(AssetSource('sounds/peg.wav'), volume: 0.15);
         }
       }
     }
   }
 
-  // ===== ZONE LOOKUP =====
+  // ===== FIND ZONE =====
   Zone? _zoneForX(double x) {
     for (final z in zones) {
       if (x >= z.x0 && x < z.x1) return z;

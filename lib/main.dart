@@ -36,12 +36,16 @@ class _PlinkoBoardState extends State<PlinkoBoard>
   @override
   void initState() {
     super.initState();
-    physics.init(onScore: _handleScore);
+
+    physics.init(
+      onScore: _handleScore,
+      onFrame: () => setState(() {}),
+    );
   }
 
   void _handleScore(double win) {
     money.addWinnings(win);
-    // Add visual/sound feedback here if needed
+    // You may add a sound or animation here if desired.
   }
 
   @override
@@ -55,6 +59,7 @@ class _PlinkoBoardState extends State<PlinkoBoard>
     final size = MediaQuery.of(context).size;
     final boardSize = Size(size.width * 0.6, size.height * 0.82);
 
+    // Rebuild the board if the size changes
     if (physics.boardSize != boardSize) {
       physics.rebuildBoard(boardSize);
     }
@@ -66,15 +71,22 @@ class _PlinkoBoardState extends State<PlinkoBoard>
           const SizedBox(height: 20),
           BalanceDisplay(money: money),
           const SizedBox(height: 10),
+
+          // WAGER INPUT ROW
           WagerInputRow(
             money: money,
-            onDrop: () => setState(() {
+            onDrop: () {
               if (money.canPlaceWager()) {
                 physics.dropBall(money.wager);
                 money.placeWager();
               }
-            }),
+              setState(() {});
+            },
           ),
+
+          const SizedBox(height: 10),
+
+          // MAIN BOARD DISPLAY
           Expanded(
             child: Center(
               child: SizedBox(
@@ -87,6 +99,7 @@ class _PlinkoBoardState extends State<PlinkoBoard>
                     physics.balls,
                     physics.bucketTop,
                     physics.zones,
+                    physics.floatingTexts,   // NEW FLOATING TEXTS
                   ),
                 ),
               ),
